@@ -1,4 +1,4 @@
-# resistance_curvature
+# ResistanceCurvature
 
 A powerful Python package for calculating resistance curvature
 
