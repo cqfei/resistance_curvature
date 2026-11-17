@@ -11,7 +11,7 @@ with codecs.open(os.path.join(here, "README.md"), encoding="utf-8") as fh:
 
 setup(
     name="ResistanceCurvature",
-    version="0.0.0.1",
+    version="0.0.0.2",
     author="Chaoqun Fei, Tinglve Zhou, Yangyang Li",
     author_email="1079484353@qq.com",
     description='Calculate resistance curvature',
@@ -19,7 +19,7 @@ setup(
     long_description=long_description,
     packages=find_packages(),
     license="Apache-2.0",
-    license_files=["LICENSE"],
+    license_files=["LICENSE.txt"],
     keywords=['python', 'Curvature', 'Resistance','Geometry','windows','mac','linux'],
     classifiers=[
         "Intended Audience :: Developers",

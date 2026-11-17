@@ -1,6 +1,90 @@
 import torch
 from typing import Tuple
 
+if __package__:
+    from .edge_curvature import sparse_edge_curvature
+    from .sparse_cholesky import SparseCholeskyPlan, symbolic_cholesky
+else:
+    from edge_curvature import sparse_edge_curvature
+    from sparse_cholesky import SparseCholeskyPlan, symbolic_cholesky
+
+
+def _resolve_method(method, use_disturb):
+    if method is None:
+        return "dense_cholesky" if use_disturb else "dense_pinv"
+    if method not in ("dense_pinv", "dense_cholesky", "sparse_cholesky"):
+        raise ValueError(f"Unknown curvature method: {method!r}")
+    return method
+
+
+def _matrix_edges(weight_matrix):
+    if weight_matrix.ndim != 2 or weight_matrix.shape[0] != weight_matrix.shape[1]:
+        raise ValueError("sparse Cholesky requires a square weight matrix")
+    if not torch.equal(weight_matrix, weight_matrix.T) or bool(weight_matrix.diagonal().ne(0).any()):
+        raise ValueError("sparse Cholesky requires a symmetric matrix with a zero diagonal")
+    rows, cols = weight_matrix.nonzero(as_tuple=True)
+    upper = rows < cols
+    rows, cols = rows[upper], cols[upper]
+    return rows, cols, weight_matrix[rows, cols]
+
+
+def _edge_matrix(n, rows, cols, values):
+    matrix = values.new_zeros((n, n))
+    matrix[rows, cols] = matrix[cols, rows] = values
+    return matrix
+
+
+def _validate_edges(n, rows, cols, weights):
+    if n < 1 or rows.ndim != 1 or rows.shape != cols.shape or rows.shape != weights.shape:
+        raise ValueError("provide a positive node count and three equally sized edge vectors")
+    if rows.dtype != torch.int64 or cols.dtype != torch.int64:
+        raise ValueError("edge endpoints must use torch.int64")
+    if rows.device != weights.device or cols.device != weights.device:
+        raise ValueError("edge endpoints and weights must be on the same device")
+    if weights.dtype not in (torch.float32, torch.float64):
+        raise ValueError("edge weights must use torch.float32 or torch.float64")
+    valid = ((rows >= 0) & (rows < n) & (cols >= 0) & (cols < n) & (rows != cols)
+             & weights.isfinite() & (weights > 0))
+    if not bool(valid.all()):
+        raise ValueError("each edge must connect two distinct valid nodes and have a finite positive weight")
+
+
+def _prepare_edge_plan(n, rows, cols, plan):
+    if plan is None:
+        return symbolic_cholesky(n, rows, cols).to(rows.device)
+    if (plan.n != n or plan.permutation.device != rows.device
+            or not torch.equal(plan.inverse_permutation[rows], plan.edge_rows)
+            or not torch.equal(plan.inverse_permutation[cols], plan.edge_cols)):
+        raise ValueError("the sparse plan must match the node count, device and ordered edge list")
+    return plan
+
+
+def _validate_unique_edges(n, rows, cols):
+    keys = torch.minimum(rows, cols) * n + torch.maximum(rows, cols)
+    if keys.unique().numel() != rows.numel():
+        raise ValueError("each undirected edge must appear once")
+
+
+def _checked_sparse_curvature(plan, rows, cols, weights, disturb_factor):
+    resistance, nodes, edges, valid = sparse_edge_curvature(plan, rows, cols, weights, disturb_factor)
+    valid = valid & ((resistance > 0) & resistance.isfinite()).all()
+    valid = valid & nodes.isfinite().all() & edges.isfinite().all()
+    if not bool(valid):
+        raise RuntimeError("sparse curvature failed: check shifted Laplacian definiteness and numerical precision")
+    return nodes, edges
+
+
+def _advance_flow(weights, curvature, step, normalize):
+    conductance = torch.where(weights != 0, 1 / weights, 0.0)
+    if normalize:
+        total = conductance.sum()
+        mean = torch.where(total != 0, (curvature * conductance).sum() / total, 0.0)
+        conductance -= step * conductance * (curvature - mean)
+    else:
+        conductance -= step * curvature * conductance
+    return torch.where(conductance != 0, 1 / conductance, 0.0)
+
+
 class ResistanceCurvature():
     """
         A class to compute resistance curvature for graphs using PyTorch.
@@ -48,7 +132,7 @@ class ResistanceCurvature():
         """
         laplacian = self.cal_laplacian(weight_matrix)
         disturbed_laplacian = laplacian + disturb_factor * torch.eye(
-            laplacian.shape[0], device=self.device
+            laplacian.shape[0], device=laplacian.device
         )
         # Cholesky decomposition for efficient inversion
         L = torch.linalg.cholesky(disturbed_laplacian)
@@ -148,103 +232,118 @@ class ResistanceCurvature():
         matrix[to_adjust] = -matrix[to_adjust]
         return matrix
 
-    def cal_curvature(
-                self,
-                weight_matrix: torch.Tensor,
-                use_disturb: bool = True,
-                disturb_factor: float = 1e-3
-        ) -> Tuple[torch.Tensor, torch.Tensor]:
+    def cal_curvature(self, weight_matrix: torch.Tensor, use_disturb: bool = True,
+                      disturb_factor: float = 1e-3, *, method: str = None
+                      ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return node curvature and a dense edge-curvature matrix.
 
+        An explicit method takes precedence over the legacy use_disturb flag.
+        Use cal_curvature_edges with sparse_cholesky for a sparse input/output path.
         """
-        Compute both node and edge curvatures.
+        method = _resolve_method(method, use_disturb)
+        if method == "sparse_cholesky":
+            rows, cols, weights = _matrix_edges(weight_matrix)
+            n = weight_matrix.shape[0]
+            nodes, edges = self.cal_curvature_edges(n, rows, cols, weights, disturb_factor=disturb_factor)
+            return nodes, _edge_matrix(n, rows, cols, edges)
 
-        Args:
-            weight_matrix: Input weight matrix.
-            use_disturb: Whether to use disturbed Laplacian inverse for stability.
-            disturb_factor: Disturbance factor for numerical stability.
-
-        Returns:
-            Tuple of (node_curvatures, edge_curvatures)
-        """
         affinity_matrix = (weight_matrix != 0).float()
+        return self._cal_curvature_dense(weight_matrix, affinity_matrix, method, disturb_factor)
 
-        if use_disturb:
-            laplacian_inverse = self.cal_laplacian_inverse_disturb(
-                weight_matrix, disturb_factor
-            )
+    def _cal_curvature_dense(self, weight_matrix, affinity_matrix, method, disturb_factor):
+        if method == "dense_cholesky":
+            laplacian_inverse = self.cal_laplacian_inverse_disturb(weight_matrix, disturb_factor)
         else:
             laplacian_inverse = self.cal_laplacian_pseudo_inverse(weight_matrix)
 
-        resistance_matrix = self.cal_resistance_matrix(
-            laplacian_inverse, affinity_matrix
-        )
+        resistance = self.cal_resistance_matrix(laplacian_inverse, affinity_matrix)
+        nodes = self.cal_node_curvature(weight_matrix, resistance)
+        edges = self.cal_edge_curvature(nodes, resistance, affinity_matrix)
+        positive = resistance[resistance > 0]
+        if positive.numel():
+            edges = edges * positive.min() / 2
+        elif not bool(affinity_matrix.any()):
+            return nodes, edges
+        else:
+            raise RuntimeError("the graph has no positive edge resistance to scale curvature")
+        return nodes, self.adjust_weights_for_leaf_nodes_matrix(edges)
 
-        node_curvature = self.cal_node_curvature(weight_matrix, resistance_matrix)
-        edge_curvature = self.cal_edge_curvature(
-            node_curvature, resistance_matrix, affinity_matrix
-        )
+    def prepare_sparse_plan(self, n, rows, cols, *, ordering="minimum_degree") -> SparseCholeskyPlan:
+        """Prepare reusable sparse structure for a fixed undirected edge list."""
+        return symbolic_cholesky(n, rows, cols, ordering=ordering).to(rows.device)
 
-        # Scale curvatures by minimum resistance for stability
-        resistance_matrix_min = resistance_matrix[resistance_matrix > 0].min() if (resistance_matrix > 0).any() else None
-        edge_curvature = edge_curvature * resistance_matrix_min / 2
+    def cal_curvature_edges(self, n, rows, cols, edge_weights, *,
+                            method="sparse_cholesky", disturb_factor=1e-3,
+                            plan: SparseCholeskyPlan = None):
+        """Return (node_curvature, edge_curvature) in node and input-edge order.
 
-        # Adjust leaf node connections
-        edge_curvature = self.adjust_weights_for_leaf_nodes_matrix(edge_curvature)
-        return node_curvature, edge_curvature
-    def cal_curvature_flow(
-                self,
-                weight_matrix: torch.Tensor,
-                n_iter: int = 1,
-                step: float = 1.0,
-                flow_norm: bool = False,
-                dtype: torch.dtype = torch.float32,
-                use_disturb: bool = True,
-                disturb_factor: float = 1e-3
-        ) -> torch.Tensor:
+        Supply int64 endpoint vectors and FP32/FP64 positive weights on the
+        same device. List each undirected edge once and omit self-loops.
         """
-        Perform curvature flow iterations to update edge weights.
+        method = _resolve_method(method, True)
+        _validate_edges(n, rows, cols, edge_weights)
+        if method == "sparse_cholesky":
+            plan = _prepare_edge_plan(n, rows, cols, plan)
+            return _checked_sparse_curvature(plan, rows, cols, edge_weights, disturb_factor)
 
-        Args:
-            weight_matrix: Initial weight matrix (similarity matrix).
-            n_iter: Number of flow iterations.
-            step: Learning rate/step size for updates.
-            flow_norm: Whether to use normalized flow.
-            dtype: Data type for computation.
-            use_disturb: Whether to use disturbed Laplacian inverse for stability.
-            disturb_factor: Disturbance factor for numerical stability.
+        if plan is not None:
+            raise ValueError("a sparse plan is only used by sparse_cholesky")
+        _validate_unique_edges(n, rows, cols)
+        nodes, matrix = self.cal_curvature(
+            _edge_matrix(n, rows, cols, edge_weights), method=method, disturb_factor=disturb_factor
+        )
+        return nodes, matrix[rows, cols]
 
-        Returns:
-            updated_weight_matrix
-        """
+    def cal_curvature_flow(self, weight_matrix: torch.Tensor, n_iter: int = 1,
+                           step: float = 1.0, flow_norm: bool = False,
+                           dtype: torch.dtype = torch.float32, use_disturb: bool = True,
+                           disturb_factor: float = 1e-3, *, method: str = None
+                           ) -> torch.Tensor:
+        """Run curvature flow, returning a dense matrix of updated weights."""
+        method = _resolve_method(method, use_disturb)
+        weight_matrix = weight_matrix.to(dtype)
+        if n_iter <= 0:
+            return weight_matrix
+        if method == "sparse_cholesky":
+            rows, cols, weights = _matrix_edges(weight_matrix)
+            n = weight_matrix.shape[0]
+            weights = self.cal_curvature_flow_edges(
+                n, rows, cols, weights, n_iter=n_iter, step=step, flow_norm=flow_norm,
+                disturb_factor=disturb_factor,
+            )
+            return _edge_matrix(n, rows, cols, weights)
 
-        weight_matrix=weight_matrix.to(dtype)
-        affinity_matrix=(weight_matrix != 0).float()
-        for _ in range(1,n_iter+1):
-            print(weight_matrix)
-            if use_disturb:
-                laplacian_inverse=self.cal_laplacian_inverse_disturb(weight_matrix,disturb_factor)
-            else:
-                laplacian_inverse=self.cal_laplacian_pseudo_inverse(weight_matrix)
-            resistance_matrix = self.cal_resistance_matrix(laplacian_inverse,affinity_matrix)
-
-            node_curvature = self.cal_node_curvature(weight_matrix, resistance_matrix)
-            edge_curvature = self.cal_edge_curvature(node_curvature, resistance_matrix, affinity_matrix)
-
-            # Scale curvatures by minimum resistance for stability
-            resistance_matrix_min = resistance_matrix[resistance_matrix > 0].min() if (resistance_matrix > 0).any() else None
-            edge_curvature = edge_curvature * resistance_matrix_min /2
-
-            # Adjust leaf node connections
-            edge_curvature = self.adjust_weights_for_leaf_nodes_matrix(edge_curvature)
-
-            # Convert weights to conductances (reciprocal)
-            conductance  = torch.where(weight_matrix != 0, 1 / weight_matrix, 0.0)
-
-            # Update conductances based on curvature flow
-            if flow_norm==False:
-                conductance -=step*edge_curvature*conductance
-            else:
-                conductance  -= step *conductance *(edge_curvature-(torch.sum(edge_curvature*conductance )/torch.sum(conductance)))
-            # Convert back to weights
-            weight_matrix = torch.where(conductance  != 0, 1 / conductance , 0.0)
+        affinity_matrix = (weight_matrix != 0).float()
+        for _ in range(n_iter):
+            _, curvature = self._cal_curvature_dense(weight_matrix, affinity_matrix, method, disturb_factor)
+            weight_matrix = _advance_flow(weight_matrix, curvature, step, flow_norm)
         return weight_matrix
+
+    def cal_curvature_flow_edges(self, n, rows, cols, edge_weights, *, n_iter=1,
+                                 step=1.0, flow_norm=False, method="sparse_cholesky",
+                                 disturb_factor=1e-3, plan: SparseCholeskyPlan = None):
+        """Run curvature flow and return edge weights in the original order.
+
+        The sparse path keeps the initial edge pattern and reuses one plan.
+        It preserves the input weight dtype and checks factorization each round.
+        """
+        method = _resolve_method(method, True)
+        _validate_edges(n, rows, cols, edge_weights)
+        if method != "sparse_cholesky":
+            if plan is not None:
+                raise ValueError("a sparse plan is only used by sparse_cholesky")
+            _validate_unique_edges(n, rows, cols)
+            matrix = self.cal_curvature_flow(
+                _edge_matrix(n, rows, cols, edge_weights), n_iter=n_iter, step=step,
+                flow_norm=flow_norm, dtype=edge_weights.dtype, method=method,
+                disturb_factor=disturb_factor,
+            )
+            return matrix[rows, cols]
+
+        if n_iter <= 0 or not edge_weights.numel():
+            return edge_weights
+        plan = _prepare_edge_plan(n, rows, cols, plan)
+        for _ in range(n_iter):
+            _, curvature = _checked_sparse_curvature(plan, rows, cols, edge_weights, disturb_factor)
+            edge_weights = _advance_flow(edge_weights, curvature, step, flow_norm)
+        return edge_weights
