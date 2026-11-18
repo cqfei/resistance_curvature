@@ -108,12 +108,81 @@ with torch.inference_mode():
 in the same order. Isolated nodes are supported. The `plan` argument is optional
 for a single call.
 
-The sparse path uses a minimum-degree elimination order, computes a sparse
-Cholesky factor, and applies a Takahashi-type selected inversion recurrence.
-It computes the diagonal entries, original-edge entries, and auxiliary inverse
-entries required by the recurrence. This edge-list path avoids allocating
-the full inverse. Its time and memory depend on elimination fill-in and the
-precomputed update indices.
+The default sparse path uses **exact sparse-prefix elimination with a dense
+Schur-complement tail**. It is a hybrid factorization of the same
+`L + epsilon I`; the split introduces no additional approximation.
+
+1. Eliminate minimum-degree vertices while their active degree is at most
+   `degree_cap` (32 by default). Symbolic analysis retains updates only for
+   these bounded-width columns. Adjacency sets are updated in place so
+   eliminating leaves does not repeatedly copy a large hub's neighbours.
+2. Factor the remaining Schur complement with dense Cholesky and invert this
+   smaller block. This replaces the long, high-fill part of scalar elimination
+   with matrix operations.
+3. Apply the Takahashi recurrence backwards through the sparse prefix to
+   recover the diagonal and original-edge inverse entries needed for curvature.
+
+On Linux CUDA installations with Triton, each sparse level uses one fused
+factorization kernel and one fused selected-inversion kernel. CPU and CUDA
+installations without Triton use the portable PyTorch implementation. The
+fused kernels were verified with PyTorch 2.8.0, CUDA 12.8 and Triton 3.4.0.
+The original fully sparse plan remains supported for existing low-level
+callers, and explicitly requesting `ordering="natural"` retains that path.
+
+For a reused plan, let `q` be the number of sparse columns, `r=n-q` the tail
+size, `F_p=q+sum(b_j)` and `U_p=sum(b_j*(b_j+1)/2)` over the sparse prefix.
+Plan and numerical storage are `O(n+m+F_p+U_p+r^2)`, rather than retaining
+the full factorization's potentially enormous update count. Since `b_j <= B`
+for the fixed cap `B`, `U_p <= (B+1)*(F_p-q)/2`. With fixed `B`, numerical
+arithmetic is `O(n+m+r^3)` and storage is `O(n+m+r^2)`. If `B` is treated as
+a variable, the padded CUDA kernels use `O(n+m+q*B^2+r^3)` arithmetic.
+The one-time CPU ordering and symbolic preparation are measured separately.
+The tail size depends on fill-in, not just the original average degree.
+In the worst case `r=n`, the method has dense cubic time and quadratic space;
+it does not guarantee a speedup for every graph.
+
+Set a different split without changing epsilon or the mathematical result:
+
+```python
+plan = rc.prepare_sparse_plan(n, rows, cols, degree_cap=32)
+node_curvature, edge_curvature = rc.cal_curvature_edges(
+    n, rows, cols, weights, method="sparse_cholesky", plan=plan,
+    disturb_factor=1e-3,
+)
+```
+
+Reuse this plan across calls or curvature-flow steps with the same topology.
+Each step still recomputes the numerical factor and selected inverse for the
+current weights. Use the edge-list interface to avoid a dense input/output.
+FP32 execution orders differ, so results agree up to floating-point error;
+use FP64 when stricter numerical agreement is needed.
+
+On five real graphs, the following measurements used one RTX 3090 (24 GB),
+FP32, unit edge weights, epsilon=0.001, two warmups and the median of seven
+synchronized calls. Both columns time the public `cal_curvature_edges` API;
+the sparse plan is reused. Memory is the maximum PyTorch reserved memory
+observed across the public calls and subsequent low-level CUDA Graph tests,
+including the graph's retained allocations (MiB).
+
+| Graph | Dense ms | Hybrid sparse ms | Speedup | Dense peak MiB | Hybrid peak MiB |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Cora | 11.246 | 2.949 | 3.81x | 302 | 6 |
+| CiteSeer | 16.442 | 2.805 | 5.86x | 452 | 6 |
+| PubMed | 1145.335 | 6.962 | 164.50x | 15216 | 90 |
+| Amazon-Photo | 101.936 | 23.827 | 4.28x | 2304 | 280 |
+| Coauthor-CS | 1054.054 | 39.752 | 26.52x | 13166 | 442 |
+
+These are steady-state measurements, not first-call speedups. Input upload,
+symbolic preparation and the first public call took approximately
+0.75/0.75/1.17/1.30/1.59 seconds for the hybrid path in table order,
+versus 0.24/0.25/1.30/0.34/1.21 seconds for dense. Those measurements
+exclude Python import, input-file loading and CUDA context initialization;
+a fresh Triton compiler cache can add compilation cost. Reusing the plan
+and process amortizes preparation and library initialization.
+All five graphs' FP64 resistances and node/edge curvatures were also compared
+at rtol=1e-8, atol=1e-9. All passed. In FP32 all edge-curvature comparisons
+passed rtol=5e-3, atol=5e-5; some near-zero node curvatures in Cora/CiteSeer
+differed by up to 6.11e-5, so that tighter node check did not pass everywhere.
 
 The returned edge curvature includes the original implementation's
 minimum-positive-resistance scaling and leaf-node sign adjustment.

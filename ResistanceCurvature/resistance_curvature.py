@@ -3,10 +3,12 @@ from typing import Tuple
 
 if __package__:
     from .edge_curvature import sparse_edge_curvature
-    from .sparse_cholesky import SparseCholeskyPlan, symbolic_cholesky
+    from .hybrid_cholesky import HybridPlan as SparseCholeskyPlan, symbolic_cholesky
+    from .sparse_cholesky import symbolic_cholesky as _legacy_symbolic_cholesky
 else:
     from edge_curvature import sparse_edge_curvature
-    from sparse_cholesky import SparseCholeskyPlan, symbolic_cholesky
+    from hybrid_cholesky import HybridPlan as SparseCholeskyPlan, symbolic_cholesky
+    from sparse_cholesky import symbolic_cholesky as _legacy_symbolic_cholesky
 
 
 def _resolve_method(method, use_disturb):
@@ -268,9 +270,15 @@ class ResistanceCurvature():
             raise RuntimeError("the graph has no positive edge resistance to scale curvature")
         return nodes, self.adjust_weights_for_leaf_nodes_matrix(edges)
 
-    def prepare_sparse_plan(self, n, rows, cols, *, ordering="minimum_degree") -> SparseCholeskyPlan:
-        """Prepare reusable sparse structure for a fixed undirected edge list."""
-        return symbolic_cholesky(n, rows, cols, ordering=ordering).to(rows.device)
+    def prepare_sparse_plan(self, n, rows, cols, *, ordering="minimum_degree", degree_cap=32) -> SparseCholeskyPlan:
+        """Prepare bounded-width sparse elimination and a dense Schur tail.
+
+        ``degree_cap`` limits the active degree of sparsely eliminated columns.
+        It controls execution and storage, without changing the requested shift.
+        """
+        if ordering == "natural":
+            return _legacy_symbolic_cholesky(n, rows, cols, ordering=ordering).to(rows.device)
+        return symbolic_cholesky(n, rows, cols, ordering=ordering, degree_cap=degree_cap).to(rows.device)
 
     def cal_curvature_edges(self, n, rows, cols, edge_weights, *,
                             method="sparse_cholesky", disturb_factor=1e-3,

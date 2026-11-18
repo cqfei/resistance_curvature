@@ -10,8 +10,10 @@ import torch
 
 if __package__:
     from .sparse_cholesky import edge_resistances, factor_laplacian
+    from . import hybrid_cholesky
 else:
     from sparse_cholesky import edge_resistances, factor_laplacian
+    import hybrid_cholesky
 
 
 def selected_curvature(resistance, rows, columns, weights, n):
@@ -56,8 +58,12 @@ def dense_edge_curvature(n, rows, cols, weights, epsilon=1e-3):
 
 def sparse_edge_curvature(plan, rows, cols, weights, epsilon=1e-3):
     """Use selected inversion with a plan for the same endpoints and edge order."""
-    factor = factor_laplacian(plan, weights, epsilon, check=False)
+    backend = hybrid_cholesky if isinstance(plan, hybrid_cholesky.HybridPlan) else None
+    factor = (backend.factor_laplacian if backend else factor_laplacian)(plan, weights, epsilon, check=False)
     pivots = factor.values[plan.diagonal_slots]
-    resistance = edge_resistances(factor)
+    resistance = (backend.edge_resistances if backend else edge_resistances)(factor)
     nodes, edges = selected_curvature(resistance, rows, cols, weights, plan.n)
-    return resistance, nodes, edges, (pivots.isfinite() & (pivots > 0)).all()
+    valid = (pivots.isfinite() & (pivots > 0)).all()
+    if backend:
+        valid = valid & (factor.info == 0)
+    return resistance, nodes, edges, valid

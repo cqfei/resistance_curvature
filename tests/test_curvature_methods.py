@@ -184,6 +184,20 @@ class CurvatureMethodsTest(unittest.TestCase):
                 self.n + 1, self.rows, self.cols, changed_weights, plan=plan
             )
 
+    @torch.no_grad()
+    def test_natural_order_plan_remains_compatible(self):
+        plan = self.calculator.prepare_sparse_plan(
+            self.n, self.rows, self.cols, ordering="natural"
+        )
+        sparse = self.calculator.cal_curvature_edges(
+            self.n, self.rows, self.cols, self.weights, plan=plan
+        )
+        dense = self.calculator.cal_curvature_edges(
+            self.n, self.rows, self.cols, self.weights, method="dense_cholesky"
+        )
+        for actual, expected in zip(sparse, dense):
+            self.assert_close(actual, expected)
+
 
 if __name__ == "__main__":
     unittest.main()
